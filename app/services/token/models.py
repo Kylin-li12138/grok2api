@@ -50,6 +50,7 @@ class TokenInfo(BaseModel):
     token: str
     status: TokenStatus = TokenStatus.ACTIVE
     quota: int = BASIC__DEFAULT_QUOTA
+    auto_delete_at: Optional[int] = None
 
     # 消耗记录（本地累加，不依赖 API 返回值）
     # 仅在 consumed_mode_enabled=true 时使用
@@ -108,6 +109,16 @@ class TokenInfo(BaseModel):
         if not token:
             raise ValueError("token cannot be empty")
         return token
+
+    @field_validator("auto_delete_at", mode="before")
+    @classmethod
+    def _normalize_auto_delete_at(cls, value):
+        if value in (None, "", 0, "0"):
+            return None
+        timestamp = int(value)
+        if timestamp <= 0:
+            return None
+        return timestamp
 
     def is_available(self, consumed_mode: bool = False) -> bool:
         """检查当前模式下 token 是否可用。"""
@@ -265,6 +276,17 @@ class TokenInfo(BaseModel):
     def mark_synced(self):
         """标记已同步"""
         self.last_sync_at = int(datetime.now().timestamp() * 1000)
+
+    def should_auto_delete(self, now_ms: Optional[int] = None) -> bool:
+        """检查是否已到自动删除时间。"""
+        if self.auto_delete_at is None:
+            return False
+        current_ms = (
+            int(datetime.now().timestamp() * 1000)
+            if now_ms is None
+            else int(now_ms)
+        )
+        return self.auto_delete_at <= current_ms
 
     def should_cool_down(self, remaining_tokens: int, threshold: int = 10) -> bool:
         """

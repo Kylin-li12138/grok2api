@@ -252,6 +252,24 @@
             <option value="ssoSuper">ssoSuper</option>
           </select>
         </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="modal-label mb-1 block" data-i18n="token.importQuota">配额</label>
+            <input type="number" id="import-quota" class="geist-input" min="0">
+          </div>
+          <div>
+            <label class="modal-label mb-1 block" data-i18n="token.importAutoDelete">自动删除</label>
+            <div class="flex gap-2">
+              <input type="number" id="import-auto-delete-value" class="geist-input min-w-0" min="0"
+                placeholder="留空则不删除" data-i18n-placeholder="token.importAutoDeletePlaceholder">
+              <select id="import-auto-delete-unit" class="geist-input w-32 shrink-0">
+                <option value="minutes" data-i18n="token.importAutoDeleteMinutes">分钟后</option>
+                <option value="hours" selected data-i18n="token.importAutoDeleteHours">小时后</option>
+                <option value="days" data-i18n="token.importAutoDeleteDays">天后</option>
+              </select>
+            </div>
+          </div>
+        </div>
         <div>
           <label class="modal-label mb-1 block" data-i18n="token.importTokenList">Token 列表 (每行一个)</label>
           <textarea id="import-text" class="geist-input font-mono h-48"

@@ -18,6 +18,11 @@ const byId = (id) => document.getElementById(id);
 const qsa = (selector) => document.querySelectorAll(selector);
 const DEFAULT_QUOTA_BASIC = 80;
 const DEFAULT_QUOTA_SUPER = 140;
+const AUTO_DELETE_MS_BY_UNIT = {
+  minutes: 60 * 1000,
+  hours: 60 * 60 * 1000,
+  days: 24 * 60 * 60 * 1000
+};
 
 function getDefaultQuotaForPool(pool) {
   return pool === 'ssoSuper' ? DEFAULT_QUOTA_SUPER : DEFAULT_QUOTA_BASIC;
@@ -111,6 +116,8 @@ async function init() {
   apiKey = await ensureAdminKey();
   if (apiKey === null) return;
   setupEditPoolDefaults();
+  setupImportPoolDefaults();
+  resetImportModal();
   setupConfirmDialog();
   setupSelectAllMenu();
   refreshPageSizeOptionsI18n();
@@ -149,13 +156,14 @@ function processTokens(data) {
       tokens.forEach(t => {
         // Normalize
         const tObj = typeof t === 'string'
-          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, tags: [] }
+          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, tags: [], auto_delete_at: null }
           : {
             token: t.token,
             status: t.status || 'active',
             quota: t.quota || 0,
             consumed: t.consumed || 0,
             note: t.note || '',
+            auto_delete_at: normalizeAutoDeleteAt(t.auto_delete_at),
             fail_count: t.fail_count || 0,
             use_count: t.use_count || 0,
             tags: t.tags || [],
@@ -596,6 +604,15 @@ function setupEditPoolDefaults() {
   });
 }
 
+function setupImportPoolDefaults() {
+  const poolSelect = byId('import-pool');
+  const quotaInput = byId('import-quota');
+  if (!poolSelect || !quotaInput) return;
+  poolSelect.addEventListener('change', () => {
+    quotaInput.value = getDefaultQuotaForPool(poolSelect.value);
+  });
+}
+
 function closeEditModal() {
   closeModal('edit-modal', () => {
     // reset styles for token input
@@ -742,6 +759,9 @@ async function syncToServer() {
       use_count: t.use_count || 0,
       tags: Array.isArray(t.tags) ? t.tags : []
     };
+    if (typeof t.auto_delete_at === 'number' && t.auto_delete_at > 0) {
+      payload.auto_delete_at = t.auto_delete_at;
+    }
     if (typeof t.created_at === 'number') payload.created_at = t.created_at;
     if (typeof t.last_used_at === 'number') payload.last_used_at = t.last_used_at;
     if (typeof t.last_fail_at === 'number') payload.last_fail_at = t.last_fail_at;
@@ -768,31 +788,38 @@ async function syncToServer() {
 
 // Import Logic
 function openImportModal() {
+  resetImportModal();
   openModal('import-modal');
 }
 
 function closeImportModal() {
-  closeModal('import-modal', () => {
-    const input = byId('import-text');
-    if (input) input.value = '';
-  });
+  closeModal('import-modal', resetImportModal);
 }
 
 async function submitImport() {
   const pool = byId('import-pool').value.trim() || 'ssoBasic';
   const text = byId('import-text').value;
+  const quotaFieldValue = parseInt(byId('import-quota').value, 10);
+  const quota = Number.isNaN(quotaFieldValue) ? getDefaultQuotaForPool(pool) : quotaFieldValue;
+  const autoDeleteAt = getImportAutoDeleteAt();
   const lines = text.split('\n');
-  const defaultQuota = getDefaultQuotaForPool(pool);
+  const tokens = lines
+    .map(line => line.trim())
+    .filter(Boolean);
 
-  lines.forEach(line => {
-    const t = line.trim();
-    if (t && !flatTokens.some(ft => ft.token === t)) {
+  if (tokens.length === 0) {
+    return showToast(t('token.tokenEmpty'), 'error');
+  }
+
+  tokens.forEach(token => {
+    if (!flatTokens.some(ft => ft.token === token)) {
       flatTokens.push({
-        token: t,
+        token: token,
         pool: pool,
         status: 'active',
-        quota: defaultQuota,
+        quota: quota,
         consumed: 0,
+        auto_delete_at: autoDeleteAt,
         note: '',
         tags: [],
         fail_count: 0,
@@ -805,6 +832,36 @@ async function submitImport() {
   await syncToServer();
   closeImportModal();
   loadData();
+}
+
+function resetImportModal() {
+  const poolSelect = byId('import-pool');
+  const quotaInput = byId('import-quota');
+  const textInput = byId('import-text');
+  const autoDeleteValue = byId('import-auto-delete-value');
+  const autoDeleteUnit = byId('import-auto-delete-unit');
+  if (poolSelect) poolSelect.value = 'ssoBasic';
+  if (quotaInput) quotaInput.value = getDefaultQuotaForPool('ssoBasic');
+  if (textInput) textInput.value = '';
+  if (autoDeleteValue) autoDeleteValue.value = '';
+  if (autoDeleteUnit) autoDeleteUnit.value = 'hours';
+}
+
+function normalizeAutoDeleteAt(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return numeric;
+}
+
+function getImportAutoDeleteAt() {
+  const valueInput = byId('import-auto-delete-value');
+  const unitSelect = byId('import-auto-delete-unit');
+  const amount = valueInput ? parseInt(valueInput.value, 10) : NaN;
+  if (Number.isNaN(amount) || amount <= 0) return null;
+  const unit = unitSelect ? unitSelect.value : 'hours';
+  const unitMs = AUTO_DELETE_MS_BY_UNIT[unit] || AUTO_DELETE_MS_BY_UNIT.hours;
+  return Date.now() + amount * unitMs;
 }
 
 // Export Logic

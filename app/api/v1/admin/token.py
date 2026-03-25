@@ -49,6 +49,7 @@ async def get_tokens():
     # 获取消耗模式配置
     from app.core.config import get_config
     mgr = await get_token_manager()
+    await mgr.cleanup_auto_delete_tokens()
     results = {}
     for pool_name, pool in mgr.pools.items():
         results[pool_name] = [t.model_dump() for t in pool.list()]

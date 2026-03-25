@@ -150,6 +150,32 @@ class TokenManager:
             return
         await self.reload()
 
+    async def cleanup_auto_delete_tokens(self) -> Dict[str, int]:
+        """删除已到自动删除时间的 Token。"""
+        now_ms = int(datetime.now().timestamp() * 1000)
+        checked = 0
+        deleted = 0
+
+        for pool_name, pool in self.pools.items():
+            due_tokens = []
+            for token in pool.list():
+                checked += 1
+                if token.should_auto_delete(now_ms):
+                    due_tokens.append(token.token)
+
+            for token_str in due_tokens:
+                if pool.remove(token_str):
+                    self._track_token_delete(token_str)
+                    deleted += 1
+                    logger.info(
+                        f"Token {token_str[:10]}... auto deleted from pool '{pool_name}'"
+                    )
+
+        if deleted:
+            await self._save(force=True)
+
+        return {"checked": checked, "deleted": deleted}
+
     def _is_consumed_mode(self) -> bool:
         """集中处理 consumed mode 配置读取。"""
         try:
