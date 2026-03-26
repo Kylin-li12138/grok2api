@@ -3,6 +3,7 @@ Videos API route (OpenAI-compatible create endpoint).
 """
 
 import base64
+import binascii
 import re
 import time
 import uuid
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import orjson
 from fastapi import APIRouter, Request, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.core.exceptions import UpstreamException, ValidationException
@@ -23,6 +24,9 @@ from app.services.grok.services.video_extend import VideoExtendService
 router = APIRouter(tags=["Videos"])
 
 VIDEO_MODEL_ID = "grok-imagine-1.0-video"
+VIDEO_MODEL_ALIASES = {
+    "grok-3-video": VIDEO_MODEL_ID,
+}
 SIZE_TO_ASPECT = {
     "1280x720": "16:9",
     "720x1280": "9:16",
@@ -30,6 +34,7 @@ SIZE_TO_ASPECT = {
     "1024x1792": "2:3",
     "1024x1024": "1:1",
 }
+ASPECT_TO_SIZE = {value: key for key, value in SIZE_TO_ASPECT.items()}
 QUALITY_TO_RESOLUTION = {
     "standard": "480p",
     "high": "720p",
@@ -44,10 +49,43 @@ class VideoCreateRequest(BaseModel):
     prompt: str = Field(..., description="Video prompt")
     model: Optional[str] = Field(VIDEO_MODEL_ID, description="Model id")
     size: Optional[str] = Field("1792x1024", description="Output size")
+    aspect_ratio: Optional[str] = Field(None, description="size 别名")
     seconds: Optional[int] = Field(6, description="Video length in seconds")
+    duration: Optional[int] = Field(None, description="seconds 别名")
     quality: Optional[str] = Field("standard", description="Quality: standard/high")
-    image_reference: Optional[Any] = Field(None, description="Structured image reference")
-    input_reference: Optional[Any] = Field(None, description="Multipart input reference file")
+    hd: Optional[bool] = Field(None, description="quality 别名; true=high")
+    image_reference: Optional[Any] = Field(None, description="Structured image reference(s)")
+    input_reference: Optional[Any] = Field(None, description="Reference input(s): string, array, or multipart file")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_alias_fields(cls, value: Any):
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        hd_value = data.get("hd")
+        if isinstance(hd_value, str):
+            lowered = hd_value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                data["hd"] = True
+            elif lowered in {"false", "0", "no", "off"}:
+                data["hd"] = False
+
+        if data.get("model") in VIDEO_MODEL_ALIASES:
+            data["model"] = VIDEO_MODEL_ALIASES[data["model"]]
+
+        if data.get("size") in (None, "") and data.get("aspect_ratio") not in (None, ""):
+            aspect_ratio = str(data.get("aspect_ratio")).strip()
+            data["size"] = ASPECT_TO_SIZE.get(aspect_ratio, aspect_ratio)
+
+        if data.get("seconds") in (None, "") and data.get("duration") not in (None, ""):
+            data["seconds"] = data.get("duration")
+
+        if data.get("quality") in (None, "") and data.get("hd") is not None:
+            data["quality"] = "high" if bool(data.get("hd")) else "standard"
+
+        return data
 
 
 class VideoExtendDirectRequest(BaseModel):
@@ -98,7 +136,7 @@ def _extract_video_url(content: str) -> str:
 
 
 def _normalize_model(model: Optional[str]) -> str:
-    requested = (model or VIDEO_MODEL_ID).strip()
+    requested = VIDEO_MODEL_ALIASES.get((model or VIDEO_MODEL_ID).strip(), (model or VIDEO_MODEL_ID).strip())
     if requested != VIDEO_MODEL_ID:
         raise ValidationException(
             message=f"The model `{VIDEO_MODEL_ID}` is required for video generation.",
@@ -158,65 +196,100 @@ def _validate_reference_value(value: str, param: str) -> str:
         return candidate
     if candidate.startswith("data:"):
         return candidate
+    collapsed = "".join(candidate.split())
+    if len(collapsed) >= 32:
+        padding = "=" * (-len(collapsed) % 4)
+        try:
+            decoded = base64.b64decode(f"{collapsed}{padding}", validate=True)
+        except binascii.Error:
+            decoded = b""
+        if decoded:
+            if decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime = "image/png"
+            elif decoded.startswith(b"\xff\xd8\xff"):
+                mime = "image/jpeg"
+            elif decoded.startswith((b"GIF87a", b"GIF89a")):
+                mime = "image/gif"
+            elif decoded.startswith(b"RIFF") and decoded[8:12] == b"WEBP":
+                mime = "image/webp"
+            else:
+                mime = "image/png"
+            return f"data:{mime};base64,{collapsed}{padding}"
     raise ValidationException(
-        message=f"{param} must be a URL or data URI",
+        message=f"{param} must be a URL, data URI, or raw base64 image",
         param=param,
         code="invalid_reference",
     )
 
 
-def _parse_image_reference(value: Any) -> Optional[str]:
+def _collect_reference_texts(value: Any, param: str) -> List[str]:
     if value is None or value == "":
-        return None
+        return []
 
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
-            return None
+            return []
         if stripped[0] in {"{", "["}:
             try:
-                value = orjson.loads(stripped)
+                return _collect_reference_texts(orjson.loads(stripped), param)
             except orjson.JSONDecodeError:
-                # allow plain url/data-uri in multipart text field as a practical fallback
-                return _validate_reference_value(stripped, "image_reference")
-        else:
-            return _validate_reference_value(stripped, "image_reference")
+                pass
+        return [_validate_reference_value(stripped, param)]
+
+    if isinstance(value, list):
+        references: List[str] = []
+        for item in value:
+            references.extend(_collect_reference_texts(item, param))
+        return references
 
     if not isinstance(value, dict):
         raise ValidationException(
             message=(
-                "image_reference must be an object with exactly one of "
-                "`image_url` or `file_id`"
+                f"{param} must be a string, array, or object containing "
+                "`url`, `image_url`, `data`, `base64`, or `b64`"
             ),
-            param="image_reference",
+            param=param,
             code="invalid_reference",
         )
 
-    image_url = value.get("image_url")
-    file_id = value.get("file_id")
-    image_url = image_url.strip() if isinstance(image_url, str) else ""
-    file_id = file_id.strip() if isinstance(file_id, str) else ""
-
-    has_image_url = bool(image_url)
-    has_file_id = bool(file_id)
-    if has_image_url == has_file_id:
-        raise ValidationException(
-            message="image_reference requires exactly one of image_url or file_id",
-            param="image_reference",
-            code="invalid_reference",
-        )
-
-    if has_file_id:
+    if "file_id" in value and not any(
+        key in value for key in ("url", "image_url", "data", "base64", "b64", "references")
+    ):
         raise ValidationException(
             message=(
-                "image_reference.file_id is not supported in current reverse pipeline; "
-                "please use image_reference.image_url or multipart input_reference"
+                f"{param}.file_id is not supported in current reverse pipeline; "
+                f"please provide `{param}.image_url`, `{param}.url`, or multipart `input_reference`"
             ),
-            param="image_reference.file_id",
+            param=f"{param}.file_id",
             code="unsupported_reference",
         )
 
-    return _validate_reference_value(image_url, "image_reference.image_url")
+    references: List[str] = []
+    for key in ("url", "data", "base64", "b64", "references"):
+        if key in value:
+            references.extend(_collect_reference_texts(value.get(key), f"{param}.{key}"))
+
+    if "image_url" in value:
+        image_value = value.get("image_url")
+        if isinstance(image_value, dict):
+            references.extend(
+                _collect_reference_texts(image_value.get("url"), f"{param}.image_url.url")
+            )
+        else:
+            references.extend(_collect_reference_texts(image_value, f"{param}.image_url"))
+
+    if references:
+        return references
+
+    raise ValidationException(
+        message=(
+            f"{param} must be a URL, data URI, raw base64 string, or a list/object "
+            "containing reference values"
+        ),
+        param=param,
+        code="invalid_reference",
+    )
 
 
 async def _upload_to_data_uri(file: UploadFile, param: str) -> str:
@@ -234,15 +307,12 @@ async def _upload_to_data_uri(file: UploadFile, param: str) -> str:
 
 async def _build_references_for_json(payload: BaseModel) -> List[str]:
     references: List[str] = []
-    parsed_image_ref = _parse_image_reference(getattr(payload, "image_reference", None))
-    if parsed_image_ref:
-        references.append(parsed_image_ref)
-    if getattr(payload, "input_reference", None) not in (None, ""):
-        raise ValidationException(
-            message="input_reference must be uploaded as multipart/form-data file",
-            param="input_reference",
-            code="invalid_reference",
-        )
+    references.extend(
+        _collect_reference_texts(getattr(payload, "image_reference", None), "image_reference")
+    )
+    references.extend(
+        _collect_reference_texts(getattr(payload, "input_reference", None), "input_reference")
+    )
     return references
 
 
@@ -254,8 +324,8 @@ async def _build_payload_and_references_for_form(
     size: Optional[str],
     seconds: Optional[int],
     quality: Optional[str],
-    image_reference: Optional[str],
-    input_reference: Optional[UploadFile],
+    image_reference_values: List[Any],
+    input_reference_values: List[Any],
 ) -> Tuple[BaseModel, List[str]]:
     try:
         payload = schema.model_validate(
@@ -265,7 +335,7 @@ async def _build_payload_and_references_for_form(
                 "size": size,
                 "seconds": seconds,
                 "quality": quality,
-                "image_reference": image_reference,
+                "image_reference": None,
                 "input_reference": None,
             }
         )
@@ -273,18 +343,15 @@ async def _build_payload_and_references_for_form(
         _raise_validation_error(exc)
 
     references: List[str] = []
-    if isinstance(input_reference, (UploadFile, StarletteUploadFile)):
-        references.append(await _upload_to_data_uri(input_reference, "input_reference"))
-    elif input_reference not in (None, ""):
-        raise ValidationException(
-            message="input_reference must be a file in multipart/form-data",
-            param="input_reference",
-            code="invalid_reference",
-        )
+    for item in input_reference_values:
+        if isinstance(item, (UploadFile, StarletteUploadFile)):
+            references.append(await _upload_to_data_uri(item, "input_reference"))
+        elif item not in (None, ""):
+            references.extend(_collect_reference_texts(item, "input_reference"))
 
-    parsed_image_ref = _parse_image_reference(payload.image_reference)
-    if parsed_image_ref:
-        references.append(parsed_image_ref)
+    for item in image_reference_values:
+        references.extend(_collect_reference_texts(item, "image_reference"))
+
     return payload, references
 
 
@@ -295,14 +362,21 @@ def _multipart_create_schema(default_seconds: int) -> Dict[str, Any]:
         "properties": {
             "prompt": {"type": "string"},
             "model": {"type": "string", "default": VIDEO_MODEL_ID},
+            "aspect_ratio": {"type": "string", "description": "Alias for size, e.g. 16:9"},
             "size": {"type": "string", "default": "1792x1024"},
+            "duration": {"type": "integer", "description": "Alias for seconds"},
             "seconds": {"type": "integer", "default": default_seconds},
+            "hd": {"type": "boolean", "description": "Alias for quality, true=high"},
             "quality": {"type": "string", "default": "standard"},
             "image_reference": {
                 "type": "string",
-                "description": "JSON string for image_reference object",
+                "description": "Reference string or JSON string containing one or more image references",
             },
-            "input_reference": {"type": "string", "format": "binary"},
+            "input_reference": {
+                "type": "string",
+                "format": "binary",
+                "description": "Repeat this field to upload multiple files",
+            },
         },
     }
 
@@ -444,8 +518,8 @@ async def create_video(request: Request):
         size=form.get("size"),
         seconds=form.get("seconds"),
         quality=form.get("quality"),
-        image_reference=form.get("image_reference"),
-        input_reference=form.get("input_reference"),
+        image_reference_values=form.getlist("image_reference"),
+        input_reference_values=form.getlist("input_reference"),
     )
     return await _create_video_from_payload(payload, references, require_extension=False)
 

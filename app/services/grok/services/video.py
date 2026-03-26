@@ -130,8 +130,57 @@ def _build_mode_flag(preset: str) -> str:
     return mode_map.get(preset, "--mode=custom")
 
 
+_IMAGE_PLACEHOLDER_RE = re.compile(r"@图(\d+)")
+
+
+def _build_reference_message(
+    prompt: str, preset: str, image_asset_ids: Optional[List[str]] = None
+) -> str:
+    ids = [
+        aid.strip() for aid in (image_asset_ids or [])
+        if isinstance(aid, str) and aid.strip()
+    ]
+    text = prompt.strip()
+
+    if ids and _IMAGE_PLACEHOLDER_RE.search(text):
+        def _replace(m: re.Match) -> str:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(ids):
+                return f"@{ids[idx]}"
+            return m.group(0)
+
+        text = _IMAGE_PLACEHOLDER_RE.sub(_replace, text)
+        used = {int(m.group(1)) - 1 for m in _IMAGE_PLACEHOLDER_RE.finditer(prompt)}
+        remaining = [
+            f"@{aid}" for i, aid in enumerate(ids) if i not in used
+        ]
+        if remaining:
+            text = " ".join(remaining) + " " + text
+    elif ids:
+        mention_text = " ".join(f"@{aid}" for aid in ids)
+        text = f"{mention_text} {text}" if text else mention_text
+
+    parts = [text, _build_mode_flag(preset)]
+    return " ".join(part for part in parts if part)
+
+
 def _build_message(prompt: str, preset: str) -> str:
-    return f"{prompt} {_build_mode_flag(preset)}".strip()
+    return _build_reference_message(prompt, preset)
+
+
+def _normalize_reference_urls(image_urls: List[str]) -> List[str]:
+    normalized: List[str] = []
+    for image_url in image_urls:
+        candidate = _pick_str(image_url)
+        if not candidate:
+            continue
+        if re.search(r"([?&])cache=\d+\b", candidate):
+            normalized.append(candidate)
+        elif "?" in candidate:
+            normalized.append(f"{candidate}&cache=1")
+        else:
+            normalized.append(f"{candidate}?cache=1")
+    return normalized
 
 
 def _build_base_config(
@@ -139,17 +188,19 @@ def _build_base_config(
     aspect_ratio: str,
     resolution_name: str,
     video_length: int,
+    image_references: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    return {
-        "modelMap": {
-            "videoGenModelConfig": {
-                "aspectRatio": aspect_ratio,
-                "parentPostId": parent_post_id,
-                "resolutionName": resolution_name,
-                "videoLength": video_length,
-            }
-        }
+    config = {
+        "aspectRatio": aspect_ratio,
+        "parentPostId": parent_post_id,
+        "resolutionName": resolution_name,
+        "videoLength": video_length,
+        "isVideoEdit": False,
     }
+    if image_references and len(image_references) > 1:
+        config["isReferenceToVideo"] = True
+        config["imageReferences"] = _normalize_reference_urls(image_references)
+    return {"modelMap": {"videoGenModelConfig": config}}
 
 
 def _build_extension_config(
@@ -230,6 +281,7 @@ def _build_round_config(
     prompt: str,
     aspect_ratio: str,
     resolution_name: str,
+    reference_image_urls: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     if not plan.is_extension:
         return _build_base_config(
@@ -237,6 +289,7 @@ def _build_round_config(
             aspect_ratio,
             resolution_name,
             plan.video_length,
+            image_references=reference_image_urls,
         )
 
     if not original_post_id:
@@ -740,6 +793,14 @@ class VideoService:
             token, prompt="", media_type="MEDIA_POST_TYPE_IMAGE", media_url=image_url
         )
 
+    async def create_reference_post(self, token: str, prompt: str) -> str:
+        return await self.create_post(
+            token,
+            prompt=prompt,
+            media_type="MEDIA_POST_TYPE_VIDEO",
+            media_url=None,
+        )
+
     async def generate(
         self,
         token: str,
@@ -767,23 +828,44 @@ class VideoService:
         self,
         token: str,
         prompt: str,
-        image_url: str,
+        image_urls: List[str],
+        image_asset_ids: Optional[List[str]] = None,
         aspect_ratio: str = "3:2",
         video_length: int = 6,
         resolution: str = "480p",
         preset: str = "normal",
     ) -> AsyncGenerator[bytes, None]:
         """Single-round image-to-video generation stream."""
-        post_id = await self.create_image_post(token, image_url)
-        model_config_override = _build_base_config(
-            post_id,
-            aspect_ratio,
-            resolution,
-            video_length,
-        )
+        references = [url for url in image_urls if _pick_str(url)]
+        if not references:
+            raise ValidationException("image_urls is required for image-to-video generation")
+
+        if len(references) == 1:
+            post_id = await self.create_image_post(token, references[0])
+            message = _build_message(prompt, preset)
+            model_config_override = _build_base_config(
+                post_id,
+                aspect_ratio,
+                resolution,
+                video_length,
+            )
+        else:
+            post_id = await self.create_reference_post(token, prompt)
+            message = _build_reference_message(
+                prompt,
+                preset,
+                image_asset_ids=image_asset_ids,
+            )
+            model_config_override = _build_base_config(
+                post_id,
+                aspect_ratio,
+                resolution,
+                video_length,
+                image_references=references,
+            )
         return await _request_round_stream(
             token=token,
-            message=_build_message(prompt, preset),
+            message=message,
             model_config_override=model_config_override,
         )
 
@@ -845,24 +927,33 @@ class VideoService:
 
         service = VideoService()
         message = _build_message(prompt, preset)
+        reference_image_urls: Optional[List[str]] = None
 
-        image_url = None
+        image_urls: List[str] = []
+        image_asset_ids: List[str] = []
         if image_attachments:
             upload_service = UploadService()
             try:
-                if len(image_attachments) > 1:
-                    logger.info(
-                        "Video generation supports a single reference image; using the first one."
-                    )
-                attach_data = image_attachments[0]
-                _, file_uri = await upload_service.upload_file(attach_data, token)
-                image_url = f"https://assets.grok.com/{file_uri}"
-                logger.info(f"Image uploaded for video: {image_url}")
+                for attach_data in image_attachments:
+                    file_id, file_uri = await upload_service.upload_file(attach_data, token)
+                    image_url = f"https://assets.grok.com/{file_uri}"
+                    image_urls.append(image_url)
+                    image_asset_ids.append(file_id)
+                    logger.info(f"Image uploaded for video: {image_url}")
             finally:
                 await upload_service.close()
 
-        if image_url:
-            seed_post_id = await service.create_image_post(token, image_url)
+        if image_urls:
+            if len(image_urls) == 1:
+                seed_post_id = await service.create_image_post(token, image_urls[0])
+            else:
+                seed_post_id = await service.create_reference_post(token, prompt)
+                message = _build_reference_message(
+                    prompt,
+                    preset,
+                    image_asset_ids=image_asset_ids,
+                )
+                reference_image_urls = image_urls
         else:
             seed_post_id = await service.create_post(token, prompt)
 
@@ -889,6 +980,7 @@ class VideoService:
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 resolution_name=generation_resolution,
+                reference_image_urls=reference_image_urls,
             )
             response = await _request_round_stream(
                 token=token,
@@ -914,6 +1006,7 @@ class VideoService:
                         prompt=prompt,
                         aspect_ratio=aspect_ratio,
                         resolution_name=generation_resolution,
+                        reference_image_urls=reference_image_urls,
                     )
                     response = await _request_round_stream(
                         token=token,

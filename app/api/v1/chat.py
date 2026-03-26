@@ -10,7 +10,7 @@ import uuid
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import orjson
 
 from app.services.grok.services.chat import ChatService
@@ -37,10 +37,41 @@ class MessageItem(BaseModel):
 class VideoConfig(BaseModel):
     """视频生成配置"""
 
+    model_config = ConfigDict(extra="ignore")
+
     aspect_ratio: Optional[str] = Field("3:2", description="视频比例: 1280x720(16:9), 720x1280(9:16), 1792x1024(3:2), 1024x1792(2:3), 1024x1024(1:1)")
     video_length: Optional[int] = Field(6, description="视频时长(秒): 6-30")
+    duration: Optional[int] = Field(None, description="video_length 别名")
     resolution_name: Optional[str] = Field("480p", description="视频分辨率: 480p, 720p")
+    resolution: Optional[str] = Field(None, description="resolution_name 别名")
+    hd: Optional[bool] = Field(None, description="true=720p, false=480p")
     preset: Optional[str] = Field("custom", description="风格预设: fun, normal, spicy")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_alias_fields(cls, value: Any):
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        hd_value = data.get("hd")
+        if isinstance(hd_value, str):
+            lowered = hd_value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                data["hd"] = True
+            elif lowered in {"false", "0", "no", "off"}:
+                data["hd"] = False
+
+        if data.get("video_length") in (None, "") and data.get("duration") not in (None, ""):
+            data["video_length"] = data.get("duration")
+
+        if data.get("resolution_name") in (None, ""):
+            if data.get("resolution") not in (None, ""):
+                data["resolution_name"] = data.get("resolution")
+            elif data.get("hd") is not None:
+                data["resolution_name"] = "720p" if bool(data.get("hd")) else "480p"
+
+        return data
 
       
 class ImageConfig(BaseModel):
@@ -80,6 +111,9 @@ ALLOWED_IMAGE_SIZES = {
     "1024x1024",
 }
 IMAGINE_FAST_MODEL_ID = "grok-imagine-1.0-fast"
+MODEL_ALIASES = {
+    "grok-3-video": "grok-imagine-1.0-video",
+}
 
 
 def _validate_media_input(value: str, field_name: str, param: str):
@@ -264,6 +298,8 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
         )
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
+    request.model = MODEL_ALIASES.get(request.model, request.model)
+
     # 验证模型
     if not ModelService.valid(request.model):
         raise ValidationException(
