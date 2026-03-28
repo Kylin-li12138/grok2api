@@ -4,6 +4,7 @@ Grok video generation service.
 
 import asyncio
 import math
+import random
 import re
 import time
 import uuid
@@ -932,16 +933,19 @@ class VideoService:
         image_urls: List[str] = []
         image_asset_ids: List[str] = []
         if image_attachments:
-            upload_service = UploadService()
-            try:
-                for attach_data in image_attachments:
+            for idx, attach_data in enumerate(image_attachments):
+                upload_service = UploadService()
+                try:
                     file_id, file_uri = await upload_service.upload_file(attach_data, token)
                     image_url = f"https://assets.grok.com/{file_uri}"
                     image_urls.append(image_url)
                     image_asset_ids.append(file_id)
                     logger.info(f"Image uploaded for video: {image_url}")
-            finally:
-                await upload_service.close()
+                finally:
+                    await upload_service.close()
+
+                if idx < len(image_attachments) - 1:
+                    await asyncio.sleep(random.uniform(0.03, 0.05))
 
         if image_urls:
             if len(image_urls) == 1:

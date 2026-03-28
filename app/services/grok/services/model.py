@@ -215,10 +215,20 @@ class ModelService:
 
     _map = {m.model_id: m for m in MODELS}
 
+    _VIDEO_MODEL_PREFIX = "grok-imagine-1.0-video"
+
+    @classmethod
+    def _resolve_id(cls, model_id: str) -> str:
+        if model_id in cls._map:
+            return model_id
+        if model_id.startswith(cls._VIDEO_MODEL_PREFIX):
+            return cls._VIDEO_MODEL_PREFIX
+        return model_id
+
     @classmethod
     def get(cls, model_id: str) -> Optional[ModelInfo]:
         """获取模型信息"""
-        return cls._map.get(model_id)
+        return cls._map.get(cls._resolve_id(model_id))
 
     @classmethod
     def list(cls) -> list[ModelInfo]:
@@ -228,7 +238,7 @@ class ModelService:
     @classmethod
     def valid(cls, model_id: str) -> bool:
         """模型是否有效"""
-        return model_id in cls._map
+        return cls._resolve_id(model_id) in cls._map
 
     @classmethod
     def to_grok(cls, model_id: str) -> Tuple[str, str]:

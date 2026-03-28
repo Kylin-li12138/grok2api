@@ -72,8 +72,21 @@ class VideoCreateRequest(BaseModel):
             elif lowered in {"false", "0", "no", "off"}:
                 data["hd"] = False
 
-        if data.get("model") in VIDEO_MODEL_ALIASES:
-            data["model"] = VIDEO_MODEL_ALIASES[data["model"]]
+        model = data.get("model") or ""
+        if model in VIDEO_MODEL_ALIASES:
+            data["model"] = VIDEO_MODEL_ALIASES[model]
+        elif isinstance(model, str) and model.startswith(VIDEO_MODEL_ID) and model != VIDEO_MODEL_ID:
+            suffix = model[len(VIDEO_MODEL_ID):].lstrip("-")
+            _suffix_ratio_map = {
+                "landscape": "16:9", "portrait": "9:16", "square": "1:1",
+            }
+            for part in suffix.split("-"):
+                low = part.lower()
+                if low in _suffix_ratio_map and data.get("size") in (None, ""):
+                    data["size"] = ASPECT_TO_SIZE.get(_suffix_ratio_map[low], data.get("size"))
+                elif low.endswith("s") and low[:-1].isdigit() and data.get("seconds") in (None, ""):
+                    data["seconds"] = int(low[:-1])
+            data["model"] = VIDEO_MODEL_ID
 
         if data.get("size") in (None, "") and data.get("aspect_ratio") not in (None, ""):
             aspect_ratio = str(data.get("aspect_ratio")).strip()

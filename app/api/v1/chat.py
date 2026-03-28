@@ -115,6 +115,37 @@ MODEL_ALIASES = {
     "grok-3-video": "grok-imagine-1.0-video",
 }
 
+_VIDEO_MODEL_PREFIX = "grok-imagine-1.0-video"
+_VIDEO_SUFFIX_RATIO_MAP = {
+    "landscape": "16:9",
+    "portrait": "9:16",
+    "square": "1:1",
+}
+
+
+def _parse_video_model_suffix(model_id: str) -> tuple[str, Optional[str], Optional[int]]:
+    """Parse model name like grok-imagine-1.0-video-portrait-10s.
+
+    Returns (canonical_model_id, aspect_ratio_or_None, seconds_or_None).
+    """
+    if not model_id.startswith(_VIDEO_MODEL_PREFIX):
+        return model_id, None, None
+    suffix = model_id[len(_VIDEO_MODEL_PREFIX):]
+    if not suffix:
+        return _VIDEO_MODEL_PREFIX, None, None
+
+    suffix = suffix.lstrip("-")
+    parts = suffix.split("-")
+    ratio = None
+    seconds = None
+    for part in parts:
+        low = part.lower()
+        if low in _VIDEO_SUFFIX_RATIO_MAP:
+            ratio = _VIDEO_SUFFIX_RATIO_MAP[low]
+        elif low.endswith("s") and low[:-1].isdigit():
+            seconds = int(low[:-1])
+    return _VIDEO_MODEL_PREFIX, ratio, seconds
+
 
 def _validate_media_input(value: str, field_name: str, param: str):
     """Verify media input is a valid URL or data URI"""
@@ -299,6 +330,17 @@ def _validate_image_config(image_conf: ImageConfig, *, stream: bool):
 def validate_request(request: ChatCompletionRequest):
     """验证请求参数"""
     request.model = MODEL_ALIASES.get(request.model, request.model)
+
+    canonical, suffix_ratio, suffix_seconds = _parse_video_model_suffix(request.model)
+    if canonical != request.model:
+        request.model = canonical
+        if suffix_ratio or suffix_seconds:
+            config = request.video_config or VideoConfig()
+            if suffix_ratio and config.aspect_ratio in (None, "3:2"):
+                config.aspect_ratio = suffix_ratio
+            if suffix_seconds and config.video_length in (None, 6):
+                config.video_length = suffix_seconds
+            request.video_config = config
 
     # 验证模型
     if not ModelService.valid(request.model):

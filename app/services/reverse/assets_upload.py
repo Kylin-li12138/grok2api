@@ -44,7 +44,7 @@ class AssetsUploadReverse:
                 cookie_token=token,
                 content_type="application/json",
                 origin="https://grok.com",
-                referer="https://grok.com/",
+                referer="https://grok.com/imagine",
             )
 
             # Build payload
